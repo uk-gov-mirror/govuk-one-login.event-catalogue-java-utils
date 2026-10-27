@@ -1,115 +1,60 @@
 name: Publish
 
-# Automatic releases on push to main, driven by Conventional Commits. The
-# commits since the last release tag are inspected to decide the next semantic
-# version:
-#   - a breaking change (type! or a BREAKING CHANGE footer) -> major
-#   - feat                                                  -> minor
-#   - fix / perf                                            -> patch
-#   - only chore/docs/test/ci/build/BAU/dependency bumps    -> no release
-# The computed version is published to GitHub Packages, tagged, and a GitHub
-# Release is created. When no release-worthy commits are found the run is a
-# no-op. The first ever release seeds v0.1.0.
+# Publishing is triggered by publishing a GitHub Release. The release tag is the
+# version: tag v1.2.3 -> publishes 1.2.3 to GitHub Packages. To cut a release,
+# create a GitHub Release with a vX.Y.Z tag (Releases -> Draft a new release).
+# Normal pushes to main never publish; a release is a deliberate action.
 
 on:
-  push:
-    branches: [ 'main' ]
+  release:
+    types: [ published ]
+  # Manual re-run against an existing tag if a release publish needs repeating.
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. v1.2.3)"
+        required: true
+        type: string
 
 permissions:
-  contents: write   # create tags and GitHub Releases
-  packages: write   # publish to GitHub Packages
+  contents: read
+  packages: write
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
+      - name: Resolve version from tag
+        id: version
+        env:
+          REF: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          # Strip any leading "v" (v1.2.3 -> 1.2.3).
+          VERSION="${REF#v}"
+          if [ -z "${VERSION}" ]; then
+            echo "No release tag available." >&2
+            exit 1
+          fi
+          echo "Publishing version ${VERSION} (from tag ${REF})"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "ref=${REF}" >> "$GITHUB_OUTPUT"
+
       - name: Checkout
         uses: actions/checkout@v7
         with:
-          # Full history + tags are needed to find the last release and the
-          # commits since it.
-          fetch-depth: 0
-
-      - name: Determine next version
-        id: version
-        run: |
-          set -euo pipefail
-
-          # Latest semver release tag (vX.Y.Z), if any.
-          LATEST_TAG="$(git tag --list 'v*' --sort=-v:refname | head -n1 || true)"
-
-          if [ -z "${LATEST_TAG}" ]; then
-            # First release: seed v0.1.0 regardless of commit history.
-            echo "No existing tags; seeding initial release v0.1.0"
-            {
-              echo "release=true"
-              echo "version=0.1.0"
-              echo "tag=v0.1.0"
-            } >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "Latest release tag: ${LATEST_TAG}"
-
-          RANGE="${LATEST_TAG}..HEAD"
-          if [ -z "$(git log --oneline "${RANGE}")" ]; then
-            echo "No commits since ${LATEST_TAG}; nothing to release."
-            echo "release=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # Commit subjects + bodies since the last tag.
-          COMMITS="$(git log --format='%B' "${RANGE}")"
-
-          BUMP="none"
-          # Breaking change: "type!:" / "type(scope)!:" or a BREAKING CHANGE footer.
-          if echo "${COMMITS}" | grep -Eq '^[a-zA-Z]+(\([^)]*\))?!:' \
-             || echo "${COMMITS}" | grep -Eq 'BREAKING[ -]CHANGE'; then
-            BUMP="major"
-          elif echo "${COMMITS}" | grep -Eq '^feat(\([^)]*\))?:'; then
-            BUMP="minor"
-          elif echo "${COMMITS}" | grep -Eq '^(fix|perf)(\([^)]*\))?:'; then
-            BUMP="patch"
-          fi
-          echo "Detected bump: ${BUMP}"
-
-          if [ "${BUMP}" = "none" ]; then
-            echo "No feat/fix/perf/breaking commits since ${LATEST_TAG}; skipping release."
-            echo "release=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          CURRENT="${LATEST_TAG#v}"
-          MAJOR="$(echo "${CURRENT}" | cut -d. -f1)"
-          MINOR="$(echo "${CURRENT}" | cut -d. -f2)"
-          PATCH="$(echo "${CURRENT}" | cut -d. -f3)"
-          case "${BUMP}" in
-            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
-            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
-            patch) PATCH=$((PATCH + 1)) ;;
-          esac
-
-          VERSION="${MAJOR}.${MINOR}.${PATCH}"
-          echo "Next version: ${VERSION}"
-          {
-            echo "release=true"
-            echo "version=${VERSION}"
-            echo "tag=v${VERSION}"
-          } >> "$GITHUB_OUTPUT"
+          ref: ${{ steps.version.outputs.ref }}
 
       - name: JDK setup
-        if: steps.version.outputs.release == 'true'
         uses: actions/setup-java@v5
         with:
           java-version-file: '.sdkmanrc'
           distribution: 'corretto'
 
       - name: Gradle setup
-        if: steps.version.outputs.release == 'true'
         uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c # v5.0.2
 
       - name: Build and test
-        if: steps.version.outputs.release == 'true'
         env:
           # Building resolves the private event-catalogue-schema artifact (owned by
           # the event-catalogue repo), which the default GITHUB_TOKEN cannot read,
@@ -119,21 +64,7 @@ jobs:
         run: ./gradlew :lib:build -Pversion="${{ steps.version.outputs.version }}"
 
       - name: Publish to GitHub Packages
-        if: steps.version.outputs.release == 'true'
         env:
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN || secrets.GITHUB_TOKEN }}
         run: ./gradlew :lib:publish -Pversion="${{ steps.version.outputs.version }}"
-
-      - name: Tag and create GitHub Release
-        if: steps.version.outputs.release == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ steps.version.outputs.tag }}
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag "${TAG}"
-          git push origin "${TAG}"
-          gh release create "${TAG}" --title "${TAG}" --generate-notes
